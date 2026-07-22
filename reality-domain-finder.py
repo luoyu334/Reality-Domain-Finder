@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V1.0.5 交互式查找适合 Xray REALITY 的邻近 TLS 目标域名。"""
+"""V1.0.6 交互式查找适合 Xray REALITY 的邻近 TLS 目标域名。"""
 
 from __future__ import annotations
 
@@ -235,7 +235,7 @@ def candidate_score(hostname: str, observed_ips: Iterable[str], network: ipaddre
 def fetch_candidates(
     network: ipaddress.IPv4Network,
     timeout: float,
-    numeric_filter: str = "pure",
+    numeric_filter: str = "any",
     allowed_tlds: frozenset[str] | None = DEFAULT_MAINSTREAM_TLDS,
 ) -> list[Candidate]:
     encoded_prefix = urllib.parse.quote(str(network), safe="")
@@ -497,7 +497,7 @@ def parse_args() -> argparse.Namespace:
         description="交互式查找邻近 VPS、支持 TLS 1.3/X25519 的 REALITY 目标域名。"
     )
     parser.add_argument("--prefix", help="手动指定 BGP 前缀，例如 203.0.113.0/24")
-    parser.add_argument("--count", type=int, default=5, help="需要找到的域名数量，默认 5")
+    parser.add_argument("--count", type=int, default=5, help="至少需要找到的合格域名数量，默认 5")
     parser.add_argument("--batch-size", type=int, default=10, help="每批并发检测数量，默认 10")
     parser.add_argument("--max-candidates", type=int, default=200, help="最多检测的候选数量，默认 200")
     parser.add_argument("--timeout", type=float, default=10.0, help="单次请求或检测超时秒数，默认 10")
@@ -505,8 +505,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--numeric-filter",
         choices=tuple(NUMERIC_FILTER_LABELS),
-        default="pure",
-        help="数字域名过滤模式：none 不过滤、pure 过滤纯数字、any 过滤任何数字，默认 pure",
+        default="any",
+        help="数字域名过滤模式：none 不过滤、pure 过滤纯数字、any 过滤任何数字，默认 any",
     )
     parser.add_argument("--allow-all-tlds", action="store_true", help="关闭主流顶级域名过滤，允许所有顶级域名")
     parser.add_argument("--mainstream-tlds", default="com,cn,net,org", help="允许的主流顶级域名，逗号分隔，默认 com,cn,net,org")
@@ -560,7 +560,7 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
         print("请输入 y 或 n。")
 
 
-def ask_numeric_filter(default: str = "pure") -> str:
+def ask_numeric_filter(default: str = "any") -> str:
     choices = {"1": "none", "2": "pure", "3": "any"}
     default_choice = {value: key for key, value in choices.items()}[default]
     print("数字域名过滤方式：")
@@ -577,7 +577,7 @@ def ask_numeric_filter(default: str = "pure") -> str:
 def print_default_config(args: argparse.Namespace) -> None:
     print("\n选项 1 默认参数配置：")
     print("  自动检测 BGP 前缀：是")
-    print(f"  目标数量：{args.count}")
+    print(f"  合格数量下限：{args.count}")
     print(f"  每批数量：{args.batch_size}")
     print(f"  最大候选：{args.max_candidates}")
     print(f"  检测超时：{args.timeout:g} 秒")
@@ -596,7 +596,7 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace | None:
         return args
 
     print("=" * 66)
-    print(" REALITY 邻近目标域名查找器 V1.0.5")
+    print(" REALITY 邻近目标域名查找器 V1.0.6")
     print(" 自动获取 VPS IP 和 BGP 前缀，并分批检测 TLS 1.3/X25519/H2")
     print("=" * 66)
     print_default_config(args)
@@ -624,7 +624,7 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace | None:
                 args.prefix = prefix_value
                 break
             print("手动模式下 BGP 前缀不能为空。")
-    args.count = ask_positive_int("需要找到多少个合格域名", args.count)
+    args.count = ask_positive_int("至少需要找到多少个合格域名", args.count)
     args.batch_size = ask_positive_int("每批并发检测多少个域名", args.batch_size)
     args.max_candidates = ask_positive_int("最多检测多少个候选域名", args.max_candidates)
     args.timeout = ask_positive_float("单个域名检测超时（秒）", args.timeout)
@@ -647,7 +647,7 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace | None:
     print(f"  自动检测 BGP 前缀：{'是' if args.prefix is None else '否'}")
     if args.prefix is not None:
         print(f"  BGP 前缀：{args.prefix}")
-    print(f"  目标数量：{args.count}")
+    print(f"  合格数量下限：{args.count}")
     print(f"  每批数量：{args.batch_size}")
     print(f"  最大候选：{args.max_candidates}")
     print(f"  检测超时：{args.timeout:g} 秒")
@@ -789,20 +789,21 @@ def main() -> int:
                     if result.h2:
                         h2_results.append(result)
         print()
-        if len(h2_results) >= args.count:
+        if len(core_results) >= args.count:
             break
 
-    selected = h2_results[: args.count]
-    if len(selected) < args.count:
-        selected_names = {result.hostname for result in selected}
-        selected.extend(
-            result
-            for result in core_results
-            if result.hostname not in selected_names
-        )
-        selected = selected[: args.count]
+    selected = list(h2_results)
+    selected_names = {result.hostname for result in selected}
+    selected.extend(
+        result
+        for result in core_results
+        if result.hostname not in selected_names
+    )
 
-    print(f"已检测 {tested} 个候选，找到 {len(core_results)} 个核心条件合格的目标。")
+    print(
+        f"已检测 {tested} 个候选，最低目标为 {args.count} 个，"
+        f"实际找到 {len(core_results)} 个核心条件合格的目标。"
+    )
     if not selected:
         print("没有找到兼容的目标域名。", file=sys.stderr)
         return 1
