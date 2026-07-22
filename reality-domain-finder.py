@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V1.0.6 交互式查找适合 Xray REALITY 的邻近 TLS 目标域名。"""
+"""V1.0.9 交互式查找适合 Xray REALITY 的邻近 TLS 目标域名。"""
 
 from __future__ import annotations
 
@@ -10,12 +10,15 @@ import json
 import re
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -73,6 +76,14 @@ class TestResult:
     cipher: str
     success: bool
     reason: str
+    latency_ms: float | None = None
+    stability_attempts: int = 0
+    stability_successes: int = 0
+    stability_rate: float = 0.0
+    latency_median_ms: float | None = None
+    latency_average_ms: float | None = None
+    latency_max_ms: float | None = None
+    latency_jitter_ms: float | None = None
 
 
 def request_bytes(url: str, timeout: float, headers: dict[str, str] | None = None) -> bytes:
@@ -369,6 +380,7 @@ def test_candidate(
         "-alpn",
         "h2",
     ]
+    started_at = time.monotonic()
     try:
         completed = subprocess.run(
             command,
@@ -378,6 +390,7 @@ def test_candidate(
             check=False,
         )
     except subprocess.TimeoutExpired:
+        latency_ms = (time.monotonic() - started_at) * 1000
         return TestResult(
             hostname,
             resolved_ips,
@@ -389,7 +402,9 @@ def test_candidate(
             "",
             False,
             "OpenSSL 检测超时",
+            latency_ms=latency_ms,
         )
+    latency_ms = (time.monotonic() - started_at) * 1000
 
     output = (completed.stdout + completed.stderr).decode("utf-8", errors="replace")
     tls13 = bool(
@@ -417,6 +432,59 @@ def test_candidate(
         cipher,
         success,
         reason,
+        latency_ms=latency_ms,
+    )
+
+
+def evaluate_candidate(
+    candidate: Candidate,
+    network: ipaddress.IPv4Network,
+    timeout: float,
+    require_nearby: bool,
+    stability_attempts: int,
+) -> TestResult:
+    first_result = test_candidate(candidate, network, timeout, require_nearby)
+    if not first_result.success:
+        return first_result
+
+    probe_results = [first_result]
+    for _ in range(stability_attempts - 1):
+        probe_results.append(
+            test_candidate(candidate, network, timeout, require_nearby)
+        )
+
+    successful_results = [result for result in probe_results if result.success]
+    successful_latencies = [
+        result.latency_ms
+        for result in successful_results
+        if result.latency_ms is not None
+    ]
+    success_count = len(successful_results)
+    success_rate = success_count / stability_attempts
+
+    if successful_latencies:
+        median_ms = statistics.median(successful_latencies)
+        average_ms = statistics.mean(successful_latencies)
+        maximum_ms = max(successful_latencies)
+        jitter_ms = (
+            statistics.pstdev(successful_latencies)
+            if len(successful_latencies) > 1
+            else 0.0
+        )
+    else:
+        median_ms = average_ms = maximum_ms = jitter_ms = None
+
+    reason = "基础条件通过"
+    return replace(
+        first_result,
+        reason=reason,
+        stability_attempts=stability_attempts,
+        stability_successes=success_count,
+        stability_rate=success_rate,
+        latency_median_ms=median_ms,
+        latency_average_ms=average_ms,
+        latency_max_ms=maximum_ms,
+        latency_jitter_ms=jitter_ms,
     )
 
 
@@ -429,20 +497,103 @@ def print_result(result: TestResult) -> None:
         f"证书={'是' if result.verified else '否'} "
         f"邻近={'是' if result.nearby else '否'}"
     )
+    if result.stability_attempts:
+        flags += (
+            f" 握手成功率={result.stability_successes}/{result.stability_attempts}"
+            f"({result.stability_rate * 100:.0f}%)"
+        )
+    if result.latency_median_ms is not None:
+        flags += f" 中位延迟={result.latency_median_ms:.0f}ms"
     print(f"[{status}] {result.hostname:<45} {flags}  {result.reason}")
 
 
+def display_width(value: str) -> int:
+    return sum(
+        2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+        for character in value
+    )
+
+
+def pad_display(value: str, width: int, alignment: str = "left") -> str:
+    padding = max(0, width - display_width(value))
+    if alignment == "right":
+        return " " * padding + value
+    if alignment == "center":
+        left_padding = padding // 2
+        return " " * left_padding + value + " " * (padding - left_padding)
+    return value + " " * padding
+
+
+def build_aligned_table(
+    headers: tuple[str, ...],
+    rows: list[tuple[str, ...]],
+    alignments: tuple[str, ...],
+) -> list[str]:
+    widths = [
+        max(display_width(header), *(display_width(row[index]) for row in rows))
+        for index, header in enumerate(headers)
+    ]
+
+    def format_row(row: tuple[str, ...], row_alignments: tuple[str, ...]) -> str:
+        return "  ".join(
+            pad_display(value, widths[index], row_alignments[index])
+            for index, value in enumerate(row)
+        )
+
+    header_line = format_row(headers, tuple("left" for _ in headers))
+    separator_line = "  ".join("-" * width for width in widths)
+    data_lines = [format_row(row, alignments) for row in rows]
+    return [header_line, separator_line, *data_lines]
+
+
+def format_milliseconds(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1f}"
+
+
 def write_output(path: Path, results: list[TestResult], public_ip: str, prefix: str) -> None:
+    headers = (
+        "域名:端口",
+        "H2",
+        "加密套件",
+        "握手成功率",
+        "中位延迟ms",
+        "平均延迟ms",
+        "最大延迟ms",
+        "延迟波动ms",
+        "当前解析IPv4",
+    )
+    alignments = (
+        "left",
+        "center",
+        "left",
+        "right",
+        "right",
+        "right",
+        "right",
+        "right",
+        "left",
+    )
+    rows = [
+        (
+            f"{result.hostname}:443",
+            "是" if result.h2 else "否",
+            result.cipher,
+            f"{result.stability_rate * 100:.0f}%",
+            format_milliseconds(result.latency_median_ms),
+            format_milliseconds(result.latency_average_ms),
+            format_milliseconds(result.latency_max_ms),
+            format_milliseconds(result.latency_jitter_ms),
+            ",".join(result.resolved_ips),
+        )
+        for result in results
+    ]
+    table_lines = build_aligned_table(headers, rows, alignments)
     lines = [
         f"# VPS 公网 IPv4：{public_ip}",
         f"# BGP 前缀：{prefix}",
-        "# 域名:端口\tH2\t加密套件\t当前解析 IPv4",
+        "# 握手成功率与延迟仅供参考，不参与基础入选判断",
+        *table_lines,
     ]
-    for result in results:
-        lines.append(
-            f"{result.hostname}:443\t{'是' if result.h2 else '否'}\t"
-            f"{result.cipher}\t{','.join(result.resolved_ips)}"
-        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -489,6 +640,13 @@ def mark_checked(
         "cipher": result.cipher,
         "resolved_ips": list(result.resolved_ips),
         "reason": result.reason,
+        "handshake_attempts": result.stability_attempts,
+        "handshake_successes": result.stability_successes,
+        "handshake_success_rate": result.stability_rate,
+        "latency_median_ms": result.latency_median_ms,
+        "latency_average_ms": result.latency_average_ms,
+        "latency_max_ms": result.latency_max_ms,
+        "latency_jitter_ms": result.latency_jitter_ms,
     }
 
 
@@ -501,6 +659,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=10, help="每批并发检测数量，默认 10")
     parser.add_argument("--max-candidates", type=int, default=200, help="最多检测的候选数量，默认 200")
     parser.add_argument("--timeout", type=float, default=10.0, help="单次请求或检测超时秒数，默认 10")
+    parser.add_argument(
+        "--handshake-attempts",
+        dest="stability_attempts",
+        metavar="次数",
+        type=int,
+        default=5,
+        help="每个基础通过域名的总握手检测次数，仅作参考，默认 5",
+    )
     parser.add_argument("--allow-off-prefix", action="store_true", help="允许当前 DNS 不在 VPS 前缀内")
     parser.add_argument(
         "--numeric-filter",
@@ -581,6 +747,7 @@ def print_default_config(args: argparse.Namespace) -> None:
     print(f"  每批数量：{args.batch_size}")
     print(f"  最大候选：{args.max_candidates}")
     print(f"  检测超时：{args.timeout:g} 秒")
+    print(f"  握手检测次数：{args.stability_attempts}（仅作参考）")
     print(f"  强制邻近：{'是' if not args.allow_off_prefix else '否'}")
     print(f"  数字过滤：{NUMERIC_FILTER_LABELS[args.numeric_filter]}")
     print(f"  主流顶级域名过滤：{'是' if not args.allow_all_tlds else '否'}")
@@ -596,7 +763,7 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace | None:
         return args
 
     print("=" * 66)
-    print(" REALITY 邻近目标域名查找器 V1.0.6")
+    print(" REALITY 邻近目标域名查找器 V1.0.9")
     print(" 自动获取 VPS IP 和 BGP 前缀，并分批检测 TLS 1.3/X25519/H2")
     print("=" * 66)
     print_default_config(args)
@@ -628,6 +795,10 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace | None:
     args.batch_size = ask_positive_int("每批并发检测多少个域名", args.batch_size)
     args.max_candidates = ask_positive_int("最多检测多少个候选域名", args.max_candidates)
     args.timeout = ask_positive_float("单个域名检测超时（秒）", args.timeout)
+    args.stability_attempts = ask_positive_int(
+        "每个基础通过域名总共检测多少次握手（仅作参考）",
+        args.stability_attempts,
+    )
     require_nearby = ask_yes_no("是否要求域名当前仍解析到 VPS 所在前缀", not args.allow_off_prefix)
     args.allow_off_prefix = not require_nearby
     args.numeric_filter = ask_numeric_filter(args.numeric_filter)
@@ -651,6 +822,7 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace | None:
     print(f"  每批数量：{args.batch_size}")
     print(f"  最大候选：{args.max_candidates}")
     print(f"  检测超时：{args.timeout:g} 秒")
+    print(f"  握手检测次数：{args.stability_attempts}（仅作参考）")
     print(f"  强制邻近：{'是' if not args.allow_off_prefix else '否'}")
     print(f"  数字过滤：{NUMERIC_FILTER_LABELS[args.numeric_filter]}")
     print(f"  主流顶级域名过滤：{'是' if not args.allow_all_tlds else '否'}")
@@ -674,8 +846,14 @@ def main() -> int:
         return 130
     if args is None:
         return 0
-    if args.count < 1 or args.batch_size < 1 or args.max_candidates < 1 or args.timeout <= 0:
-        print("目标数量、每批数量、最大候选数和超时必须大于 0。", file=sys.stderr)
+    if (
+        args.count < 1
+        or args.batch_size < 1
+        or args.max_candidates < 1
+        or args.timeout <= 0
+        or args.stability_attempts < 1
+    ):
+        print("目标数量、每批数量、最大候选数、超时和握手检测次数必须大于 0。", file=sys.stderr)
         return 2
     try:
         allowed_tlds = (
@@ -756,7 +934,6 @@ def main() -> int:
     candidates = candidates[: args.max_candidates]
     print(f"候选域名      ：{len(candidates)} 个（每批检测 {args.batch_size} 个）\n")
 
-    h2_results: list[TestResult] = []
     core_results: list[TestResult] = []
     tested = 0
     for offset in range(0, len(candidates), args.batch_size):
@@ -766,11 +943,12 @@ def main() -> int:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as executor:
             futures = [
                 executor.submit(
-                    test_candidate,
+                    evaluate_candidate,
                     candidate,
                     network,
                     args.timeout,
                     not args.allow_off_prefix,
+                    args.stability_attempts,
                 )
                 for candidate in batch
             ]
@@ -786,18 +964,20 @@ def main() -> int:
                     return 1
                 if result.success:
                     core_results.append(result)
-                    if result.h2:
-                        h2_results.append(result)
         print()
         if len(core_results) >= args.count:
             break
 
-    selected = list(h2_results)
-    selected_names = {result.hostname for result in selected}
-    selected.extend(
-        result
-        for result in core_results
-        if result.hostname not in selected_names
+    selected = sorted(
+        core_results,
+        key=lambda result: (
+            not result.h2,
+            -result.stability_rate,
+            result.latency_median_ms
+            if result.latency_median_ms is not None
+            else float("inf"),
+            result.hostname,
+        ),
     )
 
     print(
@@ -814,14 +994,17 @@ def main() -> int:
     for index, result in enumerate(selected, 1):
         print(
             f"{index}. {result.hostname}:443  "
-            f"H2={'是' if result.h2 else '否'}  {result.cipher}"
+            f"H2={'是' if result.h2 else '否'}  "
+            f"握手成功率={result.stability_successes}/{result.stability_attempts} "
+            f"中位延迟={result.latency_median_ms:.0f}ms  {result.cipher}"
         )
     print(f"\n结果已保存到：{output_path.resolve()}")
     print("\n排名第一的技术候选配置：")
     print(f"  dest：{selected[0].hostname}:443")
     print(f"  serverNames：{selected[0].hostname}")
     print(f"  客户端 serverName：{selected[0].hostname}")
-    print("\n注意：排名只依据 TLS 与网络检测，不代表域名信誉或内容质量。")
+    print("\n注意：基础条件决定是否入选；握手成功率和延迟仅供参考并影响推荐排序。")
+    print("域名信誉和内容质量仍需人工确认。")
     return 0 if len(selected) >= args.count else 3
 
 
