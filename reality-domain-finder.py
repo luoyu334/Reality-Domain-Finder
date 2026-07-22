@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""交互式查找适合 Xray REALITY 的邻近 TLS 目标域名。"""
+"""v3 交互式查找适合 Xray REALITY 的邻近 TLS 目标域名。"""
 
 from __future__ import annotations
 
@@ -439,10 +439,22 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace | None:
         return args
 
     print("=" * 66)
-    print(" REALITY 邻近目标域名查找器 v2")
+    print(" REALITY 邻近目标域名查找器 v3")
     print(" 自动获取 VPS IP 和 BGP 前缀，并分批检测 TLS 1.3/X25519/H2")
     print("=" * 66)
-    print("直接按回车可使用方括号中的默认值。\n")
+    print("\n请选择运行方式：")
+    print("  1. 使用全部默认参数，一键开始")
+    print("  2. 自定义参数")
+    while True:
+        choice = input("请输入选项 [1]：").strip()
+        if choice in {"", "1"}:
+            print("\n已选择默认参数，开始检测……\n")
+            return args
+        if choice == "2":
+            break
+        print("请输入 1 或 2。")
+
+    print("\n进入自定义参数设置。直接按回车可使用方括号中的默认值。\n")
 
     prefix_default = args.prefix or "自动检测"
     prefix_value = ask_text("BGP 前缀（输入“自动检测”则自动获取）", prefix_default)
