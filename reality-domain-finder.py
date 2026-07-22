@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V1.0.3 交互式查找适合 Xray REALITY 的邻近 TLS 目标域名。"""
+"""V1.0.4 交互式查找适合 Xray REALITY 的邻近 TLS 目标域名。"""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ RIPE_NETWORK_INFO_URL = (
 )
 HE_IP_URL = "https://bgp.he.net/ip/{ip}"
 HE_CERT_API_URL = "https://bgp.he.net/certs/api/ip-search?ip={prefix}"
+DEFAULT_MAINSTREAM_TLDS = frozenset({"com", "cn", "net", "org"})
 
 PROVIDER_OR_DYNAMIC_RE = re.compile(
     r"(?:^|\.)(?:"
@@ -173,6 +174,24 @@ def is_numeric_domain(hostname: str) -> bool:
     return registrable_label(hostname).isdigit()
 
 
+def parse_tld_list(value: str) -> frozenset[str]:
+    tlds: set[str] = set()
+    for item in value.split(","):
+        tld = item.strip().lower().lstrip(".")
+        if not tld:
+            continue
+        if not re.fullmatch(r"[a-z0-9-]{2,63}", tld):
+            raise ValueError(f"无效的顶级域名：{item.strip()}")
+        tlds.add(tld)
+    if not tlds:
+        raise ValueError("主流顶级域名列表不能为空")
+    return frozenset(tlds)
+
+
+def has_allowed_tld(hostname: str, allowed_tlds: frozenset[str]) -> bool:
+    return hostname.rsplit(".", 1)[-1] in allowed_tlds
+
+
 def candidate_score(hostname: str, observed_ips: Iterable[str], network: ipaddress.IPv4Network) -> int:
     labels = hostname.split(".")
     score = 0
@@ -200,6 +219,7 @@ def fetch_candidates(
     network: ipaddress.IPv4Network,
     timeout: float,
     filter_numeric_domains: bool = True,
+    allowed_tlds: frozenset[str] | None = DEFAULT_MAINSTREAM_TLDS,
 ) -> list[Candidate]:
     encoded_prefix = urllib.parse.quote(str(network), safe="")
     referer = f"https://bgp.he.net/net/{network}#_SearchTab"
@@ -229,6 +249,8 @@ def fetch_candidates(
             if SERVICE_LABEL_RE.search(hostname) or SENSITIVE_RE.search(hostname):
                 continue
             if filter_numeric_domains and is_numeric_domain(hostname):
+                continue
+            if allowed_tlds is not None and not has_allowed_tld(hostname, allowed_tlds):
                 continue
             by_hostname.setdefault(hostname, set()).add(observed_ip)
 
@@ -463,6 +485,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=10.0, help="单次请求或检测超时秒数，默认 10")
     parser.add_argument("--allow-off-prefix", action="store_true", help="允许当前 DNS 不在 VPS 前缀内")
     parser.add_argument("--allow-numeric-domains", action="store_true", help="允许主域名标签为纯数字的候选")
+    parser.add_argument("--allow-all-tlds", action="store_true", help="关闭主流顶级域名过滤，允许所有顶级域名")
+    parser.add_argument("--mainstream-tlds", default="com,cn,net,org", help="允许的主流顶级域名，逗号分隔，默认 com,cn,net,org")
     parser.add_argument("--history-file", default="reality-domain-history.json", help="历史标记文件，默认 reality-domain-history.json")
     parser.add_argument("--recheck", action="store_true", help="重新验证历史文件中已经标记的域名")
     parser.add_argument("--output", default="reality-domains.txt", help="结果文件，默认 reality-domains.txt")
@@ -518,7 +542,7 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace | None:
         return args
 
     print("=" * 66)
-    print(" REALITY 邻近目标域名查找器 V1.0.3")
+    print(" REALITY 邻近目标域名查找器 V1.0.4")
     print(" 自动获取 VPS IP 和 BGP 前缀，并分批检测 TLS 1.3/X25519/H2")
     print("=" * 66)
     print("\n请选择运行方式：")
@@ -546,6 +570,13 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace | None:
     args.allow_off_prefix = not require_nearby
     filter_numeric = ask_yes_no("是否过滤纯数字主域名", not args.allow_numeric_domains)
     args.allow_numeric_domains = not filter_numeric
+    filter_mainstream_tlds = ask_yes_no("是否只允许主流顶级域名", not args.allow_all_tlds)
+    args.allow_all_tlds = not filter_mainstream_tlds
+    if filter_mainstream_tlds:
+        args.mainstream_tlds = ask_text(
+            "允许的顶级域名（使用英文逗号分隔）",
+            args.mainstream_tlds,
+        )
     skip_checked = ask_yes_no("是否跳过历史中已经验证过的域名", not args.recheck)
     args.recheck = not skip_checked
     args.history_file = ask_text("历史标记文件", args.history_file)
@@ -559,6 +590,9 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace | None:
     print(f"  检测超时：{args.timeout:g} 秒")
     print(f"  强制邻近：{'是' if not args.allow_off_prefix else '否'}")
     print(f"  过滤纯数字域名：{'是' if not args.allow_numeric_domains else '否'}")
+    print(f"  主流顶级域名过滤：{'是' if not args.allow_all_tlds else '否'}")
+    if not args.allow_all_tlds:
+        print(f"  允许的顶级域名：{args.mainstream_tlds}")
     print(f"  跳过历史已验证域名：{'是' if not args.recheck else '否'}")
     print(f"  历史文件：{args.history_file}")
     print(f"  输出文件：{args.output}\n")
@@ -579,6 +613,15 @@ def main() -> int:
         return 0
     if args.count < 1 or args.batch_size < 1 or args.max_candidates < 1 or args.timeout <= 0:
         print("目标数量、每批数量、最大候选数和超时必须大于 0。", file=sys.stderr)
+        return 2
+    try:
+        allowed_tlds = (
+            None
+            if args.allow_all_tlds
+            else parse_tld_list(args.mainstream_tlds)
+        )
+    except ValueError as exc:
+        print(f"顶级域名设置错误：{exc}", file=sys.stderr)
         return 2
     if not shutil.which("openssl"):
         print("系统中没有找到 openssl，请先安装。", file=sys.stderr)
@@ -609,6 +652,7 @@ def main() -> int:
             network,
             args.timeout,
             filter_numeric_domains=not args.allow_numeric_domains,
+            allowed_tlds=allowed_tlds,
         )
     except (RuntimeError, ValueError, urllib.error.URLError, json.JSONDecodeError) as exc:
         print(f"域名发现失败：{exc}", file=sys.stderr)
@@ -631,6 +675,10 @@ def main() -> int:
         skipped_history = before_history_filter - len(candidates)
 
     print(f"纯数字域名过滤：{'开启' if not args.allow_numeric_domains else '关闭'}")
+    if allowed_tlds is None:
+        print("主流后缀过滤  ：关闭，允许所有顶级域名")
+    else:
+        print(f"主流后缀过滤  ：开启，仅允许 {','.join(sorted(allowed_tlds))}")
     print(f"历史标记文件  ：{history_path.resolve()}")
     if args.recheck:
         print("历史跳过      ：关闭，本次允许重新验证")
